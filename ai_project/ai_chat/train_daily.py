@@ -1,0 +1,164 @@
+import os
+import random
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+mp.set_start_method("fork", force=True)
+from datasets import load_dataset, load_from_disk
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    DataCollatorWithPadding,
+    BitsAndBytesConfig,
+    logging as hf_logging
+)
+from transformers.integrations import TensorBoardCallback
+from peft import LoraConfig, get_peft_model, TaskType
+from torch.utils.data import DataLoader
+from transformers import Trainer
+
+# ─────────────────────────────────────────────────
+# 기본 설정
+# ─────────────────────────────────────────────────
+hf_logging.set_verbosity_error()
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
+# ─────────────────────────────────────────────────
+# 경로 설정 (프로젝트 폴더 기준)
+# ─────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_NAME = "gpt2"
+DATA_FILE = os.path.join(BASE_DIR, "aihub_daily.jsonl")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+TENSORBOARD_DIR = os.path.join(BASE_DIR, "runs")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ─────────────────────────────────────────────────
+# tokenizer는 항상 정의
+# ─────────────────────────────────────────────────
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
+
+# ─────────────────────────────────────────────────
+# 데이터 로딩 또는 토크나이즈 후 캐시 저장
+# ─────────────────────────────────────────────────
+try:
+    tok_train = load_from_disk(os.path.join(CACHE_DIR, "tok_train"))
+    tok_eval  = load_from_disk(os.path.join(CACHE_DIR, "tok_eval"))
+except:
+    raw = load_dataset("json", data_files=DATA_FILE)["train"]
+    small = raw.shuffle(seed=SEED).select(range(int(len(raw) * 0.3)))
+    split = small.train_test_split(test_size=0.05, seed=SEED)
+
+    def tokenize_fn(examples):
+        enc = tokenizer(
+            examples["prompt"], examples["response"],
+            truncation=True, max_length=256, padding="max_length"
+        )
+        enc["labels"] = enc["input_ids"].copy()
+        return enc
+
+    tok_train = split["train"].map(tokenize_fn, batched=True, remove_columns=["prompt", "response"])
+    tok_eval  = split["test"].map(tokenize_fn, batched=True, remove_columns=["prompt", "response"])
+    tok_train.save_to_disk(os.path.join(CACHE_DIR, "tok_train"))
+    tok_eval.save_to_disk(os.path.join(CACHE_DIR, "tok_eval"))
+
+# ─────────────────────────────────────────────────
+# 모델 로딩 (8bit + LoRA)
+# ─────────────────────────────────────────────────
+bnb_config = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0)
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    torch_dtype=torch.bfloat16,
+    device_map={"": torch.cuda.current_device()}
+)
+
+# LoRA 설정 객체를 보존한 채 속성만 수정 가능하도록
+lora_cfg = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    inference_mode=False,
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05
+)
+model = get_peft_model(base_model, lora_cfg)
+
+# ─────────────────────────────────────────────────
+# Trainer 정의
+# ─────────────────────────────────────────────────
+class MyTrainer(Trainer):
+    def __init__(self, *args, label_names=None, **kwargs):
+        callbacks = kwargs.pop('callbacks', []) + [TensorBoardCallback()]
+        super().__init__(*args, callbacks=callbacks, **kwargs)
+        if label_names:
+            self.label_names = label_names
+
+    def get_train_dataloader(self):
+        return DataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            shuffle=True,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=True,
+            persistent_workers=(self.args.dataloader_num_workers > 0),
+            prefetch_factor=2 if self.args.dataloader_num_workers > 0 else None
+        )
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        return DataLoader(
+            dataset=eval_dataset or self.eval_dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            shuffle=False,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=True,
+            persistent_workers=(self.args.dataloader_num_workers > 0),
+            prefetch_factor=2 if self.args.dataloader_num_workers > 0 else None
+        )
+
+# ─────────────────────────────────────────────────
+# 기본 TrainingArguments (튜닝 시 override 가능)
+# ─────────────────────────────────────────────────
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    run_name="gpt2_finetune_run",
+    per_device_train_batch_size=16,
+    gradient_accumulation_steps=2,
+    per_device_eval_batch_size=16,
+    num_train_epochs=1,
+    learning_rate=3e-4,
+    bf16=True,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=500,
+    eval_strategy="steps",
+    eval_steps=500,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    save_total_limit=3,
+    report_to="tensorboard",
+    logging_dir=TENSORBOARD_DIR,
+    dataloader_num_workers=4
+)
+
+trainer = MyTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tok_train,
+    eval_dataset=tok_eval,
+    data_collator=DataCollatorWithPadding(tokenizer),
+    label_names=["labels"]
+)

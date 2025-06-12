@@ -1,0 +1,10 @@
+mode,batch_size,time_s
+single,4,0.861
+single,8,0.888
+single,16,2.195
+dynamic,4,1.651
+dynamic,8,1.849
+dynamic,16,
+pipeline,4,1.091
+pipeline,8,1.88
+pipeline,16,3.098

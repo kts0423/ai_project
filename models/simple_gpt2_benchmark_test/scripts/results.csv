@@ -1,7 +1,0 @@
-batch_size,single_gpu_sec,multi_gpu_sec,speedup
-1,0.721,1.544,0.46696891191709844
-4,0.808,1.34,0.6029850746268657
-8,1.085,1.743,0.6224899598393574
-
-
-#rename for commit

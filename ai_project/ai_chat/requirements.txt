@@ -1,0 +1,13 @@
+transformers>=4.39
+datasets>=2.18
+peft>=0.9
+accelerate>=0.28
+tensorboard>=2.13
+pynvml
+scipy
+numpy
+bitsandbytes
+typing-extensions
+huggingface-hub>=0.20
+ipykernel
+ipython

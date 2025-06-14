@@ -1,8 +1,9 @@
-# 캐시 폴더 전체 제외
+__pycache__/
 cache/
-
-# 출력물 디렉토리 제외
 output/
-
-# TensorBoard 로그 제외
 runs/
+logs/
+*.bak
+*.pyc
+.env
+results/

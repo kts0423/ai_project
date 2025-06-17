@@ -4,6 +4,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import optuna
+import json # [추가] json 라이브러리를 import 합니다.
 from datasets import load_dataset, disable_caching
 
 # 캐시 기능을 비활성화하여 데이터 로딩 병목 현상을 방지합니다.
@@ -23,11 +24,10 @@ from transformers import (
 # --- 기본 설정 및 경로 ---
 MODEL_NAME = "skt/kogpt2-base-v2"
 DATA_FILE = "data/aihub_daily.jsonl"
-TEST_DATA_SAVE_PATH = "data/test_dataset.jsonl" # [추가] 테스트셋 저장 경로
 OUTPUT_DIR = "results"
+PARAMS_FILE = "best_params.json" # [추가] 결과를 저장할 파일 이름
 SEED = 42
-HPO_SUBSET_SIZE = 15000       # HPO에 사용할 데이터 샘플 크기
-FINAL_TRAIN_SUBSET_SIZE = 100000 # 최종 훈련에 사용할 데이터 샘플 크기
+HPO_SUBSET_SIZE = 15000 # HPO에 사용할 데이터 샘플 크기
 
 # GPU 사용 가능 여부 확인
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,27 +60,11 @@ tokenized_dataset = valid_dataset.map(
     remove_columns=["prompt", "response"],
     num_proc=4
 )
-print(f"총 유효 데이터 개수: {len(tokenized_dataset)}개")
 
 
-# --- [수정] 훈련/검증/테스트 세트 분리 및 테스트셋 저장 ---
-print("\n데이터셋을 훈련/검증/테스트 세트로 분리합니다...")
-# 1. 전체 데이터에서 테스트 세트를 10% 분리합니다.
-train_val_dataset = tokenized_dataset.train_test_split(test_size=0.1, seed=SEED)
-test_dataset = train_val_dataset['test']
-train_val_dataset = train_val_dataset['train'] #나머지 90% 데이터
-
-# 2. [추가] 분리된 테스트 데이터셋을 파일로 저장합니다.
-test_dataset.to_json(TEST_DATA_SAVE_PATH, force_ascii=False)
-print(f"테스트 데이터셋을 '{TEST_DATA_SAVE_PATH}' 경로에 저장했습니다.")
-
-
-# --- [1단계] HPO를 위한 데이터셋 서브샘플링 ---
-print(f"\n[1단계] HPO를 위해 남은 데이터 중 {HPO_SUBSET_SIZE}개만 샘플링합니다.")
-if len(train_val_dataset) < HPO_SUBSET_SIZE:
-    raise ValueError(f"남은 데이터({len(train_val_dataset)})가 HPO 샘플링 크기({HPO_SUBSET_SIZE})보다 작습니다.")
-    
-hpo_dataset = train_val_dataset.shuffle(seed=SEED).select(range(HPO_SUBSET_SIZE))
+# --- HPO를 위한 데이터셋 서브샘플링 ---
+print(f"\nHPO를 위해 전체 데이터 중 {HPO_SUBSET_SIZE}개만 샘플링합니다.")
+hpo_dataset = tokenized_dataset.shuffle(seed=SEED).select(range(HPO_SUBSET_SIZE))
 hpo_train_val_split = hpo_dataset.train_test_split(test_size=0.2, seed=SEED)
 hpo_train_dataset = hpo_train_val_split['train']
 hpo_eval_dataset = hpo_train_val_split['test']
@@ -91,7 +75,7 @@ print(f"HPO용 훈련 데이터: {len(hpo_train_dataset)}개, 검증 데이터: 
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 
-# --- [2단계] 서브셋 데이터로 빠른 HPO 수행 ---
+# --- HPO 목적 함수 정의 ---
 def objective(trial: optuna.trial.Trial) -> float:
     print(f"\n--- Optuna Trial #{trial.number} 시작 ---")
     
@@ -142,7 +126,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     return float(result["eval_loss"])
 
 
-print("\n[2단계] 서브셋 데이터로 빠른 하이퍼파라미터 최적화를 시작합니다...")
+# --- HPO 실행 ---
+print("\n하이퍼파라미터 최적화를 시작합니다...")
 study = optuna.create_study(direction='minimize')
 study.optimize(objective, n_trials=20)
 
@@ -154,57 +139,10 @@ print("  Best_Params: ")
 for key, value in best_trial.params.items():
     print(f"    {key}: {value}")
 
-
-# --- [3단계] 더 큰 서브셋으로 최종 모델 훈련 및 저장 ---
-print(f"\n[3단계] 찾은 최적의 파라미터로 '{FINAL_TRAIN_SUBSET_SIZE}개 데이터 서브셋'을 훈련합니다...")
-
-if len(train_val_dataset) < FINAL_TRAIN_SUBSET_SIZE:
-    print(f"경고: 남은 데이터({len(train_val_dataset)})가 최종 훈련 샘플링 크기({FINAL_TRAIN_SUBSET_SIZE})보다 작아, 남은 데이터를 모두 사용합니다.")
-    final_train_subset = train_val_dataset
-else:
-    final_train_subset = train_val_dataset.shuffle(seed=SEED).select(range(FINAL_TRAIN_SUBSET_SIZE))
-
-final_train_val_split = final_train_subset.train_test_split(test_size=0.1, seed=SEED)
-final_train_dataset = final_train_val_split['train']
-final_eval_dataset = final_train_val_split['test']
-
-print(f"최종 훈련 데이터: {len(final_train_dataset)}개")
-print(f"최종 검증 데이터: {len(final_eval_dataset)}개")
-
-best_params = study.best_trial.params
-final_training_args = TrainingArguments(
-    output_dir=os.path.join(OUTPUT_DIR, "best_model_for_run"),
-    seed=SEED,
-    learning_rate=best_params['learning_rate'],
-    per_device_train_batch_size=best_params['per_device_train_batch_size'],
-    num_train_epochs=best_params['num_train_epochs'],
-    weight_decay=best_params['weight_decay'],
-    warmup_ratio=best_params['warmup_ratio'],
-    max_grad_norm=1.0,
-    bf16=True, 
-    dataloader_num_workers=16,
-    logging_strategy="epoch",
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    report_to="none",
-)
-
-model = GPT2LMHeadModel.from_pretrained(
-    MODEL_NAME,
-    attn_implementation="flash_attention_2",
-    torch_dtype=torch.bfloat16
-).to(device)
-model.resize_token_embeddings(len(tokenizer))
-
-final_trainer = Trainer(
-    model=model,
-    args=final_training_args,
-    train_dataset=final_train_dataset,
-    eval_dataset=final_eval_dataset,
-    data_collator=data_collator,
-)
-
-final_trainer.train()
-final_trainer.save_model(os.path.join(OUTPUT_DIR, "best_model_for_run"))
-print(f"\n최종 평가를 위한 모델이 {os.path.join(OUTPUT_DIR, 'best_model_for_run')} 에 저장되었습니다.")
+# --- [수정] 최적의 파라미터를 json 파일로 저장 ---
+best_params = best_trial.params
+with open(PARAMS_FILE, "w") as f:
+    json.dump(best_params, f, indent=4)
+print(f"\n최적의 파라미터를 '{PARAMS_FILE}' 파일에 저장했습니다.")
+print(f"이제 'train_final.py'를 실행하여 최종 모델을 훈련하세요.")
 

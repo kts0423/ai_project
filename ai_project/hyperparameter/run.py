@@ -1,4 +1,5 @@
 import os
+# 스크립트 최상단에서 사용할 GPU를 0번으로 강제 지정합니다.
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
@@ -15,25 +16,29 @@ print(f"Using device: {device}")
 # --- 모델 및 토크나이저 로드 ---
 print(f"'{MODEL_DIR}' 에서 모델과 토크나이저를 로드합니다...")
 
-# 토크나이저 로드
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+try:
+    # 토크나이저 로드
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 
-# 모델 로드 (추론 시에도 Flash Attention 2와 bf16을 적용하여 속도 향상)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_DIR,
-    attn_implementation="flash_attention_2",
-    torch_dtype=torch.bfloat16
-).to(device)
+    # 모델 로드 (추론 시에도 Flash Attention 2와 bf16을 적용하여 속도 향상)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_DIR,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16
+    ).to(device)
+    
+    # 모델을 평가 모드로 설정
+    model.eval()
+    print("모델 로딩 완료. 대화를 시작합니다. (종료하려면 'exit' 또는 'quit' 입력)")
+    print("-" * 50)
 
-# 모델을 평가 모드로 설정
-model.eval()
-print("모델 로딩 완료. 대화를 시작합니다. (종료하려면 'exit' 또는 'quit' 입력)")
-print("-" * 50)
+except OSError:
+    print(f"오류: '{MODEL_DIR}' 경로에서 모델을 찾을 수 없습니다.")
+    print("먼저 'train_final.py' 스크립트를 실행하여 모델을 훈련하고 저장해주세요.")
+    exit()
 
 
 # --- 대화 시작 ---
-# 유저 입력을 기록하여 대화의 맥락을 유지
-history = ""
 while True:
     try:
         # 사용자 입력 받기
@@ -46,9 +51,6 @@ while True:
         # 프롬프트 형식에 맞춰 입력 구성
         prompt = f"User: {user_input}\nBot:"
         
-        # 전체 대화 맥락을 포함하여 프롬프트 구성 (선택 사항)
-        # full_prompt = history + prompt
-
         # 입력 텍스트를 토큰화하고 GPU로 이동
         input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
 
@@ -64,6 +66,7 @@ while True:
                 do_sample=True,
                 num_return_sequences=1,
                 eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id # pad_token_id 설정 추가
             )
         
         # 생성된 텍스트에서 입력 프롬프트를 제외하고 답변만 추출
@@ -72,11 +75,7 @@ while True:
         bot_response = response_text.replace(prompt, "").strip()
 
         print(f"Bot: {bot_response}")
-        
-        # 대화 기록 업데이트 (선택 사항)
-        # history += prompt + bot_response + tokenizer.eos_token
 
     except KeyboardInterrupt:
         print("\n대화를 종료합니다.")
         break
-

@@ -1,9 +1,22 @@
+# Python
 __pycache__/
-cache/
-output/
-runs/
-logs/
-*.bak
 *.pyc
-.env
-results/
+
+# Conda
+.conda/
+
+# VSCode
+.vscode/
+
+# Cache & Logs
+cache/
+logs/
+runs/
+
+# Data & Model Outputs (대용량 파일)
+data/
+output/
+results/checkpoint-*/
+*.safetensors
+*.pt
+*.bin
